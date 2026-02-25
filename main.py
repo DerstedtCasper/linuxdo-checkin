@@ -51,6 +51,12 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "0",
     "off",
 ]
+try:
+    BROWSE_TOPIC_COUNT = int(os.environ.get("BROWSE_TOPIC_COUNT", "3").strip())
+    if BROWSE_TOPIC_COUNT < 1:
+        raise ValueError("BROWSE_TOPIC_COUNT must be >= 1")
+except Exception:
+    BROWSE_TOPIC_COUNT = 3
 if not USERNAME:
     USERNAME = os.environ.get("USERNAME")
 if not PASSWORD:
@@ -205,8 +211,9 @@ class LinuxDoBrowser:
         if not topic_list:
             logger.error("未找到主题帖")
             return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
+        topic_count = min(BROWSE_TOPIC_COUNT, len(topic_list))
+        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择{topic_count}个")
+        for topic in random.sample(topic_list, topic_count):
             self.click_one_topic(topic.attr("href"))
         return True
 

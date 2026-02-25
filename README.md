@@ -40,10 +40,37 @@
 | `WXPUSH_URL`      | wxpush 服务器地址         | `https://your.wxpush.server`           |
 | `WXPUSH_TOKEN`    | wxpush 的 token        | `your_wxpush_token`                    |
 | `BROWSE_ENABLED`  | 是否启用浏览帖子功能        | `true` 或 `false`，默认为 `true`           |
+| `BROWSE_TOPIC_COUNT` | 每次运行浏览帖子数量      | `3`（默认值）                          |
 
 ---
 
 ## 如何使用
+
+### Windows 本地部署（推荐）
+
+1. 安装 Python 3.12（已验证可用）。
+2. 在项目目录执行：
+   ```powershell
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+3. 复制配置文件并填写账号：
+   ```powershell
+   Copy-Item ".env.example" ".env"
+   ```
+   必填：
+   - `LINUXDO_USERNAME`
+   - `LINUXDO_PASSWORD`
+4. 手动运行一次：
+   ```powershell
+   .\run_checkin.ps1
+   ```
+5. 注册 12 小时自动执行计划任务：
+   ```powershell
+   .\register_task.ps1
+   ```
+
+日志默认输出到 `logs/` 目录。
 
 ### GitHub Actions 自动运行
 
@@ -56,6 +83,7 @@
         - `LINUXDO_USERNAME`：你的 LinuxDo 用户名或邮箱。
         - `LINUXDO_PASSWORD`：你的 LinuxDo 密码。
         - (可选) `BROWSE_ENABLED`：是否启用浏览帖子，`true` 或 `false`，默认为 `true`。
+        - (可选) `BROWSE_TOPIC_COUNT`：每次运行浏览帖子数量，默认 `3`。
         - (可选) `GOTIFY_URL` 和 `GOTIFY_TOKEN`。
         - (可选) `SC3_PUSH_KEY`。
         - (可选) `WXPUSH_URL` 和 `WXPUSH_TOKEN`。
@@ -118,6 +146,7 @@
         - `LINUXDO_USERNAME`：你的LinuxDo用户名/邮箱
         - `LINUXDO_PASSWORD`：你的LinuxDo密码
         - (可选) `BROWSE_ENABLED`：是否启用浏览帖子功能，`true` 或 `false`，默认为 `true`
+        - (可选) `BROWSE_TOPIC_COUNT`：每次运行浏览帖子数量，默认 `3`
         - (可选) `GOTIFY_URL`：Gotify服务器地址
         - (可选) `GOTIFY_TOKEN`：Gotify应用Token
         - (可选) `SC3_PUSH_KEY`：Server酱³ SendKey
