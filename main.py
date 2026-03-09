@@ -97,6 +97,9 @@ class LinuxDoBrowser:
             .headless(True)
             .incognito(True)
             .set_argument("--no-sandbox")
+            .set_argument("--disable-blink-features=AutomationControlled")
+            .set_argument("--lang=zh-CN")
+            .set_argument("--window-size=1366,900")
         )
         co.set_user_agent(
             f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -147,6 +150,26 @@ class LinuxDoBrowser:
             path = ck.get("path") or "/"
             self.session.cookies.set(name, value, domain=domain, path=path)
 
+    def _log_page_snapshot(self, source: str) -> None:
+        try:
+            page_title = self.page.title
+        except Exception:
+            page_title = ''
+        try:
+            page_url = self.page.url
+        except Exception:
+            page_url = ''
+        html = self.page.html or ''
+        text_preview = ' '.join(BeautifulSoup(html, 'html.parser').get_text(' ', strip=True).split())[:300]
+        markers = []
+        lowered = f"{page_title} {page_url} {html[:2000]}".lower()
+        for keyword in ['429', 'too many requests', 'rate limit', 'captcha', 'cloudflare', 'just a moment', 'access denied']:
+            if keyword in lowered:
+                markers.append(keyword)
+        logger.warning(
+            f"{source}: page snapshot url={page_url!r}, title={page_title!r}, markers={markers}, preview={text_preview!r}"
+        )
+
     def _verify_login(self, source: str) -> bool:
         logger.info(f"{source}: verify login status on linux.do")
         self.page.get(HOME_URL)
@@ -182,7 +205,35 @@ class LinuxDoBrowser:
             logger.info(f"Browser CSRF token acquired: {csrf_token[:10]}...")
             return csrf_token
         logger.warning("Browser page did not expose a CSRF token")
+        self._log_page_snapshot("browser csrf")
         return None
+
+    def _fetch_csrf_from_html(self) -> Optional[str]:
+        logger.info("Fallback to HTML login page request...")
+        headers = {
+            "User-Agent": self.session.headers["User-Agent"],
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": HOME_URL,
+        }
+        resp = self.session.get(LOGIN_URL, headers=headers, impersonate="chrome136")
+        if resp.status_code != 200:
+            logger.error(f"HTML login page request failed: {resp.status_code}")
+            return None
+        soup = BeautifulSoup(resp.text, "html.parser")
+        csrf_token = None
+        meta = soup.select_one('meta[name="csrf-token"]')
+        if meta:
+            csrf_token = meta.get('content')
+        if not csrf_token:
+            hidden = soup.select_one('input[name="authenticity_token"]')
+            if hidden:
+                csrf_token = hidden.get('value')
+        if csrf_token:
+            logger.info(f"HTML CSRF token acquired: {csrf_token[:10]}...")
+        else:
+            logger.warning("HTML login page did not expose a CSRF token")
+        return csrf_token
 
     def _fetch_csrf_from_api(self, headers: Dict[str, str]) -> Optional[str]:
         logger.info("Fallback to API CSRF token request...")
@@ -240,6 +291,7 @@ class LinuxDoBrowser:
 
         if not submitted:
             logger.error("Browser form login could not find the login form")
+            self._log_page_snapshot("browser form login")
             return False
 
         time.sleep(random.uniform(6, 9))
@@ -300,6 +352,8 @@ class LinuxDoBrowser:
         for attempt in range(1, LOGIN_RETRY_COUNT + 1):
             logger.info(f"Start password login attempt {attempt}/{LOGIN_RETRY_COUNT}")
             csrf_token = self._fetch_csrf_from_browser()
+            if not csrf_token:
+                csrf_token = self._fetch_csrf_from_html()
             if not csrf_token:
                 csrf_token = self._fetch_csrf_from_api(headers)
             if not csrf_token:
