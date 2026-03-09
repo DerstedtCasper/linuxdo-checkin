@@ -41,7 +41,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LINUXDO_COOKIES: ${{ secrets.LINUXDO_COOKIES }}
           BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
+          BROWSE_TOPIC_COUNT: ${{ secrets.BROWSE_TOPIC_COUNT }}
         run: |
+          delay=$(( (RANDOM % 240) + 30 ))
+          echo "Sleep ${delay}s before login to avoid rate limits"
+          sleep "${delay}"
           python main.py
 
       - name: Delete workflow runs

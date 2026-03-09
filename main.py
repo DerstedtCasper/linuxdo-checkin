@@ -3,10 +3,12 @@ cron: 0 */6 * * *
 new Env("Linux.Do 签到")
 """
 
+import json
 import os
 import random
 import time
 import functools
+from typing import Dict, List, Optional
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
@@ -52,6 +54,14 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "0",
     "off",
 ]
+LOGIN_RETRY_COUNT = max(int(os.environ.get("LOGIN_RETRY_COUNT", "3").strip()), 1)
+LOGIN_RETRY_MIN_DELAY = max(
+    float(os.environ.get("LOGIN_RETRY_MIN_DELAY", "8").strip()), 1.0
+)
+LOGIN_RETRY_MAX_DELAY = max(
+    float(os.environ.get("LOGIN_RETRY_MAX_DELAY", "20").strip()),
+    LOGIN_RETRY_MIN_DELAY,
+)
 try:
     BROWSE_TOPIC_COUNT = int(os.environ.get("BROWSE_TOPIC_COUNT", "3").strip())
     if BROWSE_TOPIC_COUNT < 1:
@@ -104,8 +114,140 @@ class LinuxDoBrowser:
         # 初始化通知管理器
         self.notifier = NotificationManager()
 
+    def _retry_sleep(self, attempt: int, reason: str) -> None:
+        if attempt >= LOGIN_RETRY_COUNT:
+            return
+        sleep_s = random.uniform(LOGIN_RETRY_MIN_DELAY, LOGIN_RETRY_MAX_DELAY)
+        logger.warning(
+            f"{reason}; retry {attempt + 1}/{LOGIN_RETRY_COUNT} after {sleep_s:.2f}s"
+        )
+        time.sleep(sleep_s)
+
+    def _sync_session_cookies_to_browser(self) -> None:
+        dp_cookies = []
+        for name, value in self.session.cookies.get_dict().items():
+            dp_cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": ".linux.do",
+                    "path": "/",
+                }
+            )
+        if dp_cookies:
+            self.page.set.cookies(dp_cookies)
+
+    def _sync_browser_cookies_to_session(self) -> None:
+        for ck in self.page.cookies(all_domains=True, all_info=True):
+            name = ck.get("name")
+            value = ck.get("value")
+            if not name or value is None:
+                continue
+            domain = ck.get("domain") or "linux.do"
+            path = ck.get("path") or "/"
+            self.session.cookies.set(name, value, domain=domain, path=path)
+
+    def _verify_login(self, source: str) -> bool:
+        logger.info(f"{source}: verify login status on linux.do")
+        self.page.get(HOME_URL)
+        time.sleep(5)
+        self._sync_browser_cookies_to_session()
+        try:
+            user_ele = self.page.ele("@id=current-user")
+        except Exception as e:
+            logger.warning(f"{source}: verify exception: {e}")
+            return "avatar" in self.page.html
+        if user_ele:
+            logger.info(f"{source}: verify success")
+            return True
+        if "avatar" in self.page.html:
+            logger.info(f"{source}: verify success via avatar")
+            return True
+        logger.error(f"{source}: verify failed, current-user not found")
+        return False
+
+    def _fetch_csrf_from_browser(self) -> Optional[str]:
+        logger.info("Load login page in browser and extract CSRF token...")
+        self.page.get(LOGIN_URL)
+        time.sleep(random.uniform(2, 4))
+        csrf_token = self.page.run_js(
+            """
+            return document.querySelector('meta[name="csrf-token"]')?.content
+                || document.querySelector('input[name="authenticity_token"]')?.value
+                || null;
+            """
+        )
+        self._sync_browser_cookies_to_session()
+        if csrf_token:
+            logger.info(f"Browser CSRF token acquired: {csrf_token[:10]}...")
+            return csrf_token
+        logger.warning("Browser page did not expose a CSRF token")
+        return None
+
+    def _fetch_csrf_from_api(self, headers: Dict[str, str]) -> Optional[str]:
+        logger.info("Fallback to API CSRF token request...")
+        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
+        if resp_csrf.status_code != 200:
+            logger.error(f"API CSRF request failed: {resp_csrf.status_code}")
+            return None
+        csrf_data = resp_csrf.json()
+        csrf_token = csrf_data.get("csrf")
+        if csrf_token:
+            logger.info(f"API CSRF token acquired: {csrf_token[:10]}...")
+        else:
+            logger.error("API response did not include csrf")
+        return csrf_token
+
+    def _browser_form_login(self) -> bool:
+        logger.info("Falling back to browser form login...")
+        try:
+            self.page.get(LOGIN_URL)
+            time.sleep(random.uniform(2, 4))
+            payload = json.dumps({"username": USERNAME, "password": PASSWORD}, ensure_ascii=False)
+            script = """
+                const payload = __PAYLOAD__;
+                const loginInput = document.querySelector('input[name="login"]');
+                const passwordInput = document.querySelector('input[name="password"]');
+                if (!loginInput || !passwordInput) return false;
+
+                loginInput.focus();
+                loginInput.value = payload.username;
+                loginInput.dispatchEvent(new Event('input', { bubbles: true }));
+                loginInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+                passwordInput.focus();
+                passwordInput.value = payload.password;
+                passwordInput.dispatchEvent(new Event('input', { bubbles: true }));
+                passwordInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+                const submitButton = document.querySelector('button[type="submit"], .btn-primary, .login-button');
+                if (submitButton) {
+                    submitButton.click();
+                    return true;
+                }
+
+                const form = loginInput.closest('form');
+                if (form) {
+                    form.submit();
+                    return true;
+                }
+                return false;
+            """.replace('__PAYLOAD__', payload)
+            submitted = self.page.run_js(script)
+        except Exception as exc:
+            logger.error(f"Browser form login failed before submit: {exc}")
+            return False
+
+        if not submitted:
+            logger.error("Browser form login could not find the login form")
+            return False
+
+        time.sleep(random.uniform(6, 9))
+        self._sync_browser_cookies_to_session()
+        return self._verify_login("browser form login")
+
     @staticmethod
-    def parse_cookie_string(cookie_str: str) -> list[dict]:
+    def parse_cookie_string(cookie_str: str) -> List[Dict[str, str]]:
         """
         解析浏览器复制的 Cookie 字符串格式: "name1=value1; name2=value2"
         返回 DrissionPage 所需的 cookie 列表格式。
@@ -126,45 +268,22 @@ class LinuxDoBrowser:
         return cookies
 
     def login_with_cookies(self, cookie_str: str) -> bool:
-        """使用手动设置的 Cookie 直接登录，跳过账号密码流程"""
-        logger.info("检测到手动 Cookie，尝试 Cookie 登录...")
+        """Use a raw cookie string for login and skip password auth."""
+        logger.info("Manual cookie detected; trying cookie login...")
         dp_cookies = self.parse_cookie_string(cookie_str)
         if not dp_cookies:
-            logger.error("Cookie 解析失败或为空，无法使用 Cookie 登录")
+            logger.error("Cookie parsing failed or cookie payload is empty")
             return False
 
-        logger.info(f"成功解析 {len(dp_cookies)} 个 Cookie 条目")
+        logger.info(f"Parsed {len(dp_cookies)} cookie entries")
 
-        # 同步到 requests.Session，以便后续 API 请求（如 print_connect_info）使用
         for ck in dp_cookies:
             self.session.cookies.set(ck["name"], ck["value"], domain="linux.do")
 
-        # 同步到 DrissionPage
         self.page.set.cookies(dp_cookies)
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-        time.sleep(5)
-
-        # 验证登录状态
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"Cookie 登录验证异常: {str(e)}")
-            return True
-        if not user_ele:
-            if "avatar" in self.page.html:
-                logger.info("Cookie 登录验证成功 (通过 avatar)")
-                return True
-            logger.error("Cookie 登录验证失败 (未找到 current-user)，Cookie 可能已过期")
-            return False
-        else:
-            logger.info("Cookie 登录验证成功")
-            return True
+        return self._verify_login("cookie login")
 
     def login(self):
-        logger.info("开始账号密码登录")
-        # Step 1: Get CSRF Token
-        logger.info("获取 CSRF token...")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -172,87 +291,61 @@ class LinuxDoBrowser:
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="firefox135")
-        if resp_csrf.status_code != 200:
-            logger.error(f"获取 CSRF token 失败: {resp_csrf.status_code}")
-            return False        
-        csrf_data = resp_csrf.json()
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
-
-        # Step 2: Login
-        logger.info("正在登录...")
-        headers.update(
-            {
-                "X-CSRF-Token": csrf_token,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": "https://linux.do",
-            }
-        )
-
         data = {
             "login": USERNAME,
             "password": PASSWORD,
             "second_factor_method": "1",
             "timezone": "Asia/Shanghai",
         }
+        for attempt in range(1, LOGIN_RETRY_COUNT + 1):
+            logger.info(f"Start password login attempt {attempt}/{LOGIN_RETRY_COUNT}")
+            csrf_token = self._fetch_csrf_from_browser()
+            if not csrf_token:
+                csrf_token = self._fetch_csrf_from_api(headers)
+            if not csrf_token:
+                if self._browser_form_login():
+                    return True
+                self._retry_sleep(attempt, "Failed to acquire CSRF token")
+                continue
 
-        try:
-            resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
-            )
+            login_headers = {
+                **headers,
+                "X-CSRF-Token": csrf_token,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://linux.do",
+            }
+            try:
+                resp_login = self.session.post(
+                    SESSION_URL,
+                    data=data,
+                    impersonate="chrome136",
+                    headers=login_headers,
+                )
+            except Exception as exc:
+                logger.error(f"Login request error: {exc}")
+                if self._browser_form_login():
+                    return True
+                self._retry_sleep(attempt, "Login request error")
+                continue
 
             if resp_login.status_code == 200:
                 response_json = resp_login.json()
                 if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
+                    logger.error(f"Login failed: {response_json.get('error')}")
                     return False
-                logger.info("登录成功!")
-            else:
-                logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
-                return False
-        except Exception as e:
-            logger.error(f"登录请求异常: {e}")
+                logger.info("Password login succeeded, syncing cookies...")
+                self._sync_session_cookies_to_browser()
+                return self._verify_login("password login")
+
+            logger.error(f"Login failed, status code: {resp_login.status_code}")
+            if resp_login.status_code in (403, 429):
+                if self._browser_form_login():
+                    return True
+                self._retry_sleep(attempt, f"Site returned {resp_login.status_code}")
+                continue
+            logger.error(resp_login.text)
             return False
-
-        # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        cookies_dict = self.session.cookies.get_dict()
-
-        dp_cookies = []
-        for name, value in cookies_dict.items():
-            dp_cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".linux.do",
-                    "path": "/",
-                }
-            )
-
-        self.page.set.cookies(dp_cookies)
-
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
-        else:
-            logger.info("登录验证成功")
-            return True
+        return False
 
     def click_topic(self):
         topic_list = self.page.ele("@id=list-area").eles(".:title")
@@ -311,25 +404,27 @@ class LinuxDoBrowser:
 
     def run(self):
         try:
-            # 优先使用手动 Cookie 登录，没有再使用账号密码
             if COOKIES:
                 login_res = self.login_with_cookies(COOKIES)
                 if not login_res:
-                    logger.warning("Cookie 登录失败，尝试账号密码登录...")
+                    logger.warning("Cookie login failed, falling back to password login...")
                     login_res = self.login()
             else:
                 login_res = self.login()
-            if not login_res:  # 登录
-                logger.warning("登录验证失败")
+
+            if not login_res:
+                logger.warning("Login was not established; skip browse and connect info steps")
+                return
 
             if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()  # 点击主题
+                click_topic_res = self.click_topic()
                 if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
+                    logger.error("Browse step failed because no topic list was available")
                     return
-                logger.info("完成浏览任务")
-            self.print_connect_info()  # 打印连接信息
-            self.send_notifications(BROWSE_ENABLED)  # 发送通知
+                logger.info("Browse task finished")
+
+            self.print_connect_info()
+            self.send_notifications(BROWSE_ENABLED)
         finally:
             try:
                 self.page.close()
