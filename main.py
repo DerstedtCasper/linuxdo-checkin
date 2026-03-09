@@ -166,6 +166,8 @@ class LinuxDoBrowser:
         for keyword in ['429', 'too many requests', 'rate limit', 'captcha', 'cloudflare', 'just a moment', 'access denied']:
             if keyword in lowered:
                 markers.append(keyword)
+        self.last_page_markers = markers
+        self.last_page_preview = text_preview
         logger.warning(
             f"{source}: page snapshot url={page_url!r}, title={page_title!r}, markers={markers}, preview={text_preview!r}"
         )
@@ -456,7 +458,7 @@ class LinuxDoBrowser:
             logger.info(f"等待 {wait_time:.2f} 秒...")
             time.sleep(wait_time)
 
-    def run(self):
+    def run(self) -> bool:
         try:
             if COOKIES:
                 login_res = self.login_with_cookies(COOKIES)
@@ -467,18 +469,23 @@ class LinuxDoBrowser:
                 login_res = self.login()
 
             if not login_res:
+                if "too many requests" in self.last_page_markers or "429" in self.last_page_markers:
+                    logger.error(
+                        "linux.do returned Too Many Requests on the GitHub runner; set LINUXDO_COOKIES or use a self-hosted runner"
+                    )
                 logger.warning("Login was not established; skip browse and connect info steps")
-                return
+                return False
 
             if BROWSE_ENABLED:
                 click_topic_res = self.click_topic()
                 if not click_topic_res:
                     logger.error("Browse step failed because no topic list was available")
-                    return
+                    return False
                 logger.info("Browse task finished")
 
             self.print_connect_info()
             self.send_notifications(BROWSE_ENABLED)
+            return True
         finally:
             try:
                 self.page.close()
@@ -541,4 +548,5 @@ if __name__ == "__main__":
         print("请设置 LINUXDO_COOKIES（Cookie 登录），或同时设置 USERNAME 和 PASSWORD（账号密码登录）")
         exit(1)
     browser = LinuxDoBrowser()
-    browser.run()
+    if not browser.run():
+        raise SystemExit(2)
